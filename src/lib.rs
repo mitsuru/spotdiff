@@ -54,16 +54,33 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
             if submitted != Some(app.generation()) {
                 // Pending images have not been sent. Keep the visible frame until
                 // its replacement is ready, so an operation doesn't flash blank.
-                session.delete_ids(&pending_ids)?;
-                pending_ids.clear();
                 submitted = Some(app.generation());
                 let viewport = app.viewport();
-                if viewport.width > 0 && viewport.height > 0 {
-                    pending_ids = session.allocate_ids(if app.mode() == app::Mode::SideBySide {
+                let reused = prepared.as_mut().is_some_and(|frame| {
+                    frame.pan_to(
+                        app.comparison(),
+                        app.generation(),
+                        app.mode(),
+                        viewport,
+                        cell,
+                    )
+                });
+                if reused {
+                    session.delete_ids(&pending_ids)?;
+                    pending_ids.clear();
+                    dirty = true;
+                } else if viewport.width > 0 && viewport.height > 0 {
+                    let count = if app.mode() == app::Mode::SideBySide {
                         2
                     } else {
                         1
-                    });
+                    };
+                    // Keep ownership of the pending IDs while pan requests are
+                    // coalesced. A result can still cover input that arrived later.
+                    if pending_ids.len() != count {
+                        session.delete_ids(&pending_ids)?;
+                        pending_ids = session.allocate_ids(count);
+                    }
                     worker.submit(RenderRequest {
                         generation: app.generation(),
                         mode: app.mode(),
@@ -74,20 +91,41 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
                     })?;
                     dirty = prepared.is_none();
                 } else {
+                    session.delete_ids(&pending_ids)?;
+                    pending_ids.clear();
                     if let Some(old) = prepared.take() {
                         retired_ids.extend(old.image_ids);
                     }
                     dirty = true;
                 }
             }
-            if let Some((generation, result)) = worker.poll()
-                && let Some(frame) = render::accept_result(app.generation(), generation, result)?
-            {
-                if let Some(old) = prepared.replace(frame) {
-                    retired_ids.extend(old.image_ids);
+            if let Some((generation, result)) = worker.poll() {
+                let frame = match result {
+                    Ok(mut frame) => {
+                        if frame.image_ids == pending_ids
+                            && (generation == app.generation()
+                                || frame.pan_to(
+                                    app.comparison(),
+                                    app.generation(),
+                                    app.mode(),
+                                    app.viewport(),
+                                    cell,
+                                ))
+                        {
+                            Some(frame)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(error) => render::accept_result(app.generation(), generation, Err(error))?,
+                };
+                if let Some(frame) = frame {
+                    if let Some(old) = prepared.replace(frame) {
+                        retired_ids.extend(old.image_ids);
+                    }
+                    pending_ids.clear();
+                    dirty = true;
                 }
-                pending_ids.clear();
-                dirty = true;
             }
             if dirty {
                 session.begin_update()?;

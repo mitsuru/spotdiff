@@ -55,7 +55,9 @@ class TerminalTests(unittest.TestCase):
                 if keys is not None and not sent and b'Tab:' in output:
                     os.write(master, keys)
                     sent = True
-                if steps and replied and output[image_offset:].count(b'm=0;') >= expected_images:
+                completed = output[image_offset:].count(b'm=0;') + len(re.findall(
+                    rb'\x1b_G[^;]*a=p[^;]*;\x1b\\', output[image_offset:]))
+                if steps and replied and completed >= expected_images:
                     action, images = steps[step_index]
                     if isinstance(action, bytes):
                         os.write(master, action)
@@ -181,7 +183,52 @@ class TerminalTests(unittest.TestCase):
                         ((16, 60, 600, 320), 1), (b'q', 0),
                     ])
                     self.assertEqual(code, 0)
-                    self.assertEqual(output.count(b'a=T,f=32'), 15)
+                    self.assertEqual(output.count(b'a=T,f=32') + output.count(b'a=p,'), 15)
+
+    def test_pan_reuses_uploaded_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'pan.png'
+            path.write_bytes(png(500, 300))
+            code, output, _ = self.run_pty([BINARY, str(path), str(path)],
+                compression=True, steps=[
+                    (b'+', 2), (b'l', 2), (b'j', 2),
+                    (b'h', 2), (b'k', 2), (b'q', 0),
+                ])
+        self.assertEqual(code, 0)
+        self.assertEqual(output.count(b'a=T,f=32'), 4,
+                         'pan retransmitted image pixels')
+        placements = [dict(field.split(b'=', 1) for field in header.split(b','))
+                      for header in re.findall(rb'\x1b_G([^;]*a=p[^;]*);', output)]
+        self.assertEqual(len(placements), 8)
+        self.assertEqual([(int(p[b'x']), int(p[b'y'])) for p in placements],
+                         [(10, 0)] * 2 + [(10, 20)] * 2 + [(0, 20)] * 2 + [(0, 0)] * 2)
+        self.assertEqual(len({p[b'i'] for p in placements}), 2)
+
+    def test_pan_beyond_buffer_refreshes_and_cleans_up_owned_images(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'pan.png'
+            path.write_bytes(png(500, 300))
+            for compression in (False, True):
+                with self.subTest(compression=compression):
+                    code, output, _ = self.run_pty([BINARY, str(path), str(path)],
+                        compression=compression, steps=[(b'+', 2)] +
+                        [(b'l', 2)] * 12 + [(b'h', 2)] * 12 + [(b'q', 0)])
+                    self.assertEqual(code, 0)
+                    self.assertEqual(output.count(b'a=T,f=32'), 8,
+                                     'buffer boundary did not trigger a fresh upload')
+                    uploaded, live = set(), set()
+                    for header in re.findall(rb'\x1b_G([^;]+);', output):
+                        fields = dict(field.split(b'=', 1) for field in header.split(b','))
+                        if fields.get(b'a') == b'T':
+                            live.add(fields[b'i'])
+                            uploaded.add(fields[b'i'])
+                        elif fields.get(b'a') == b'p':
+                            self.assertIn(fields[b'i'], live, 'placement reused a deleted image')
+                            self.assertEqual((fields[b'w'], fields[b'h']), (b'220', b'120'))
+                        elif fields.get(b'd') == b'I':
+                            live.discard(fields[b'i'])
+                    self.assertEqual(len(uploaded), 8)
+                    self.assertFalse(live, 'owned image data survived terminal cleanup')
 
     def test_non_regular_inputs_fail_before_terminal_setup(self):
         with tempfile.TemporaryDirectory() as directory:
