@@ -187,7 +187,7 @@ pub fn prepare(c: &Comparison, r: &RenderRequest) -> anyhow::Result<PreparedFram
         "Invalid image zoom"
     );
     diff::validate_rgba_size(r.viewport.width, r.viewport.height)?;
-    let required = if r.mode == Mode::SideBySide { 2 } else { 1 };
+    let required = r.mode.image_count();
     ensure!(r.image_ids.len() == required, "Not enough image IDs");
     let size = Size::new(
         (r.viewport.width / u32::from(r.cell_pixels.0)).try_into()?,
@@ -222,7 +222,7 @@ pub fn prepare(c: &Comparison, r: &RenderRequest) -> anyhow::Result<PreparedFram
         }),
     };
     match r.mode {
-        Mode::SideBySide => {
+        Mode::SideBySide | Mode::Blink => {
             if c.before.is_some() {
                 p.before = Some(make(Side::Before, r.image_ids[0])?);
             }
@@ -277,10 +277,16 @@ impl Renderer {
             Paragraph::new(header).style(Style::default().fg(Color::Cyan)),
             l.header,
         );
-        let mode = if a.mode() == Mode::SideBySide {
-            "Side by side"
+        let mode = match a.mode() {
+            Mode::SideBySide => "Side by side",
+            Mode::Highlight => "Highlight",
+            Mode::Blink if a.blink_auto() => "Blink (Auto: 500ms)",
+            Mode::Blink => "Blink (Manual)",
+        };
+        let keys = if a.mode() == Mode::Blink {
+            "Tab:mode Space:flip a:auto +/-:zoom hjkl:pan f:fit 1:actual q:quit"
         } else {
-            "Highlight"
+            "Tab:mode +/-:zoom hjkl/arrows:pan f:fit 1:actual q:quit"
         };
         let ratio = if c.compared == 0 {
             0.0
@@ -288,7 +294,7 @@ impl Renderer {
             c.changed as f64 / c.compared as f64 * 100.0
         };
         let footer = format!(
-            "{mode}  {:.1}%  Changed: {} / {} px ({ratio:.2}%)\nTab:mode +/-:zoom hjkl/arrows:pan f:fit 1:actual q:quit",
+            "{mode}  {:.1}%  Changed: {} / {} px ({ratio:.2}%)\n{keys}",
             a.viewport().zoom * 100.0,
             c.changed,
             c.compared
@@ -335,6 +341,21 @@ impl Renderer {
                 p.and_then(|p| p.highlight.as_ref()),
                 None,
             ),
+            Mode::Blink => match a.blink_side() {
+                Side::Before => image(
+                    l.highlight,
+                    "Before",
+                    p.and_then(|p| p.before.as_ref()),
+                    c.before.is_none().then_some("No image before addition"),
+                ),
+                Side::After => image(
+                    l.highlight,
+                    "After",
+                    p.and_then(|p| p.after.as_ref()),
+                    c.after.is_none().then_some("No image after deletion"),
+                ),
+                Side::Highlight => unreachable!("Blink only shows Before or After"),
+            },
         }
     }
 
@@ -351,18 +372,41 @@ impl Renderer {
         if l.too_small {
             return Ok(());
         }
-        let mut write = |image: &mut Option<KittyImage>, area: ratatui::layout::Rect| {
+        fn write(
+            out: &mut impl std::io::Write,
+            image: &mut Option<KittyImage>,
+            area: ratatui::layout::Rect,
+        ) -> anyhow::Result<()> {
             if let Some(image) = image {
                 image.write(out, area.inner(Margin::new(1, 1)))?;
             }
-            Ok::<_, anyhow::Error>(())
-        };
+            Ok(())
+        }
         match app.mode() {
             Mode::SideBySide => {
-                write(&mut prepared.before, l.before)?;
-                write(&mut prepared.after, l.after)?;
+                write(out, &mut prepared.before, l.before)?;
+                write(out, &mut prepared.after, l.after)?;
             }
-            Mode::Highlight => write(&mut prepared.highlight, l.highlight)?,
+            Mode::Highlight => write(out, &mut prepared.highlight, l.highlight)?,
+            Mode::Blink => {
+                let (visible, hidden) = match app.blink_side() {
+                    Side::Before => (&mut prepared.before, &mut prepared.after),
+                    Side::After => (&mut prepared.after, &mut prepared.before),
+                    Side::Highlight => unreachable!("Blink only shows Before or After"),
+                };
+                let inner = l.highlight.inner(Margin::new(1, 1));
+                if let Some(image) = visible {
+                    if let Some(background) = hidden {
+                        // Keep both placements alive: herdr --remote evicts images
+                        // without placements. Our opaque, equal-sized crops ensure
+                        // that only the foreground image is visible in this pane.
+                        background.write_layer(out, inner, 0)?;
+                    }
+                    image.write_layer(out, inner, 1)?;
+                } else if let Some(image) = hidden {
+                    image.hide(out)?;
+                }
+            }
         }
         Ok(())
     }
@@ -504,6 +548,8 @@ mod tests {
         for (mode, side) in [
             (Mode::SideBySide, Side::Before),
             (Mode::SideBySide, Side::After),
+            (Mode::Blink, Side::Before),
+            (Mode::Blink, Side::After),
             (Mode::Highlight, Side::Highlight),
         ] {
             for zoom in [0.37, 0.5, 1.0, 2.0] {
@@ -519,7 +565,7 @@ mod tests {
                     },
                     cell_pixels: (8, 8),
                     compress: false,
-                    image_ids: if mode == Mode::SideBySide {
+                    image_ids: if mode != Mode::Highlight {
                         vec![42, 43]
                     } else {
                         vec![42]
@@ -687,5 +733,171 @@ mod tests {
         assert!(text.contains("i=4242"));
         assert!(text.contains("m=1"));
         assert!(text.contains("m=0"));
+    }
+    #[test]
+    fn blink_keeps_both_placements_and_reuses_uploaded_images_after_pan() {
+        let c = Arc::new(
+            compare(
+                Some(RgbaImage::from_pixel(256, 192, Rgba([255, 0, 0, 90]))),
+                Some(RgbaImage::from_pixel(192, 256, Rgba([0, 255, 0, 128]))),
+            )
+            .unwrap(),
+        );
+        let mut a = App::new(c.clone());
+        let area = Rect::new(0, 0, 20, 8);
+        let cell = (8, 8);
+        a.resize(area, cell);
+        let key = |a: &mut App, code| {
+            a.on_key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        };
+        key(&mut a, crossterm::event::KeyCode::Tab);
+        key(&mut a, crossterm::event::KeyCode::Tab);
+        key(&mut a, crossterm::event::KeyCode::Char('1'));
+        for side in [Side::Before, Side::After] {
+            let raster = rasterize_viewport(&c, side, &a.viewport());
+            assert_eq!(raster.dimensions(), (144, 16));
+            assert!(
+                raster.pixels().all(|pixel| pixel[3] == 255),
+                "transparent source pixels must not expose the other layer"
+            );
+        }
+        let mut p = prepare(
+            &c,
+            &RenderRequest {
+                generation: a.generation(),
+                mode: a.mode(),
+                viewport: a.viewport(),
+                cell_pixels: cell,
+                compress: true,
+                image_ids: vec![42, 43],
+            },
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        Renderer::write_images(&mut out, area, &a, &mut p).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("a=T,").count(), 2);
+        let headers = text
+            .split("\x1b_G")
+            .skip(1)
+            .map(|command| command.split_once(';').unwrap().0)
+            .filter(|header| header.contains("a=T,"))
+            .collect::<Vec<_>>();
+        assert!(headers[0].contains("i=43,") && headers[0].contains("z=0,"));
+        assert!(headers[1].contains("i=42,") && headers[1].contains("z=1,"));
+        assert!(
+            headers
+                .iter()
+                .all(|header| header.contains("x=0,y=0,w=144,h=16,"))
+        );
+        for (code, hidden, shown, x) in [
+            (crossterm::event::KeyCode::Char(' '), 42, 43, 0),
+            (crossterm::event::KeyCode::Char(' '), 43, 42, 0),
+            (crossterm::event::KeyCode::Char('l'), 43, 42, 8),
+            (crossterm::event::KeyCode::Char(' '), 42, 43, 8),
+        ] {
+            key(&mut a, code);
+            assert!(p.pan_to(&c, a.generation(), a.mode(), a.viewport(), cell));
+            let mut out = Vec::new();
+            Renderer::write_images(&mut out, area, &a, &mut p).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(!text.contains("a=T,") && !text.contains("a=t,"));
+            assert!(
+                !text.contains("a=d,"),
+                "removing a placement evicts herdr's remote cache"
+            );
+            assert!(text.contains(&format!("a=p,i={hidden},p=1,x={x},y=0,w=144,h=16,C=1,z=0")));
+            assert!(text.contains(&format!("a=p,i={shown},p=1,x={x},y=0,w=144,h=16,C=1,z=1")));
+        }
+        let mut idle = Vec::new();
+        Renderer::write_images(&mut idle, area, &a, &mut p).unwrap();
+        assert!(idle.is_empty());
+    }
+    #[test]
+    fn blink_missing_side_clears_visible_image_and_shows_its_label() {
+        for missing_before in [true, false] {
+            let image = RgbaImage::from_pixel(3, 1, Rgba([255, 0, 0, 255]));
+            let c = Arc::new(
+                if missing_before {
+                    compare(None, Some(image))
+                } else {
+                    compare(Some(image), None)
+                }
+                .unwrap(),
+            );
+            let mut a = App::new(c.clone());
+            let area = Rect::new(0, 0, 80, 16);
+            a.resize(area, (10, 20));
+            for _ in 0..2 {
+                a.on_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Tab,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+            let mut p = prepare(
+                &c,
+                &RenderRequest {
+                    generation: a.generation(),
+                    mode: a.mode(),
+                    viewport: a.viewport(),
+                    cell_pixels: (10, 20),
+                    compress: false,
+                    image_ids: vec![42, 43],
+                },
+            )
+            .unwrap();
+            let labels = SourcePair {
+                before: InputSide {
+                    label: "old.png".into(),
+                    bytes: None,
+                },
+                after: InputSide {
+                    label: "new.png".into(),
+                    bytes: None,
+                },
+            };
+            let mut t = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            for after in [false, true, false] {
+                let mut out = Vec::new();
+                Renderer::write_images(&mut out, area, &a, &mut p).unwrap();
+                t.draw(|f| Renderer::draw(f, &a, Some(&p), &labels))
+                    .unwrap();
+                let text = t
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>()
+                    .replace(' ', "");
+                let missing = if after {
+                    !missing_before
+                } else {
+                    missing_before
+                };
+                if missing {
+                    assert!(text.contains(if after {
+                        "Noimageafterdeletion"
+                    } else {
+                        "Noimagebeforeaddition"
+                    }));
+                    if after || !missing_before {
+                        assert!(String::from_utf8(out).unwrap().contains("a=d,d=i,"));
+                    }
+                } else {
+                    assert!(
+                        !text.contains("Noimagebeforeaddition")
+                            && !text.contains("Noimageafterdeletion")
+                    );
+                }
+                a.on_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
+        }
     }
 }

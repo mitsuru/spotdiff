@@ -12,7 +12,7 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
     use std::{
         io::{self, Write},
         sync::Arc,
-        time::Duration,
+        time::{Duration, Instant},
     };
     let labels = source::load(&request, &std::env::current_dir()?)?;
     let before = labels
@@ -46,11 +46,13 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
         let mut pending_ids = Vec::new();
         let mut submitted = None;
         let mut displayed_area = None;
+        let mut displayed_revision = None;
         loop {
             let size = terminal.size()?;
             let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
             app.resize(area, cell);
-            let mut dirty = false;
+            app.tick(Instant::now());
+            let mut dirty = displayed_revision != Some(app.display_revision());
             let mut retired_ids = Vec::new();
             if submitted != Some(app.generation()) {
                 // Pending images have not been sent. Keep the visible frame until
@@ -76,11 +78,7 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
                     pending_ids.clear();
                     dirty = true;
                 } else if viewport.width > 0 && viewport.height > 0 {
-                    let count = if app.mode() == app::Mode::SideBySide {
-                        2
-                    } else {
-                        1
-                    };
+                    let count = app.mode().image_count();
                     // Keep ownership of the pending IDs while pan requests are
                     // coalesced. A result can still cover input that arrived later.
                     if pending_ids.len() != count {
@@ -95,7 +93,7 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
                         compress,
                         image_ids: pending_ids.clone(),
                     })?;
-                    dirty = prepared.is_none();
+                    dirty |= prepared.is_none();
                 } else {
                     session.delete_ids(&pending_ids)?;
                     pending_ids.clear();
@@ -150,6 +148,7 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
                     displayed_area = Some(area);
                 }
                 session.end_update()?;
+                displayed_revision = Some(app.display_revision());
             }
             // Poll input frequently only while an asynchronous frame is pending.
             // Completed frames otherwise waited for the full 50ms idle timeout.
@@ -158,7 +157,11 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
             } else {
                 4
             };
-            if event::poll(Duration::from_millis(timeout))? {
+            let timeout = Duration::from_millis(timeout);
+            let timeout = app
+                .blink_timeout(Instant::now())
+                .map_or(timeout, |blink| timeout.min(blink));
+            if event::poll(timeout)? {
                 let mut quit = false;
                 loop {
                     if let Event::Key(key) = event::read()?

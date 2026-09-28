@@ -20,7 +20,7 @@ pub struct KittyImage {
     initial_region: ImageRegion,
     transmission: String,
     sent: bool,
-    placement: Option<(Rect, ImageRegion)>,
+    placement: Option<(Rect, ImageRegion, i32)>,
 }
 impl KittyImage {
     pub fn new(
@@ -53,7 +53,7 @@ impl KittyImage {
                 let compression = if compress { "o=z," } else { "" };
                 write!(
                     transmission,
-                    "i={id},a=T,f=32,{compression}t=d,s={},v={},x={},y={},w={},h={},C=1,p=1,",
+                    "i={id},a=T,f=32,{compression}t=d,s={},v={},x={},y={},w={},h={},C=1,p=1,z=0,",
                     image.width(),
                     image.height(),
                     region.x,
@@ -89,8 +89,21 @@ impl KittyImage {
         self.region = region;
     }
 
+    /// Delete only our placement, retaining the terminal's image storage.
+    pub fn hide(&mut self, out: &mut impl Write) -> anyhow::Result<()> {
+        if self.placement.is_some() {
+            write!(out, "\x1b_Ga=d,d=i,i={},p=1,q=2;\x1b\\", self.id)?;
+            self.placement = None;
+        }
+        Ok(())
+    }
+
     pub fn write(&mut self, out: &mut impl Write, area: Rect) -> anyhow::Result<()> {
-        if self.placement == Some((area, self.region)) {
+        self.write_layer(out, area, 0)
+    }
+
+    pub fn write_layer(&mut self, out: &mut impl Write, area: Rect, z: i32) -> anyhow::Result<()> {
+        if self.placement == Some((area, self.region, z)) {
             return Ok(());
         }
         ensure!(
@@ -101,11 +114,11 @@ impl KittyImage {
         if self.sent {
             write!(
                 out,
-                "\x1b_Gq=2,a=p,i={},p=1,x={},y={},w={},h={},C=1;\x1b\\",
+                "\x1b_Gq=2,a=p,i={},p=1,x={},y={},w={},h={},C=1,z={z};\x1b\\",
                 self.id, self.region.x, self.region.y, self.region.width, self.region.height,
             )?;
         } else {
-            if self.region == self.initial_region {
+            if self.region == self.initial_region && z == 0 {
                 out.write_all(self.transmission.as_bytes())?;
             } else {
                 // A completed background frame can cover newer pan input. Only
@@ -118,14 +131,15 @@ impl KittyImage {
                     )
                 };
                 let header = self.transmission[..end]
-                    .replace(&fields(self.initial_region), &fields(self.region));
+                    .replace(&fields(self.initial_region), &fields(self.region))
+                    .replace("z=0,", &format!("z={z},"));
                 out.write_all(header.as_bytes())?;
                 out.write_all(&self.transmission.as_bytes()[end..])?;
             }
             self.transmission = String::new();
             self.sent = true;
         }
-        self.placement = Some((area, self.region));
+        self.placement = Some((area, self.region, z));
         Ok(())
     }
 }

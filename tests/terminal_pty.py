@@ -204,6 +204,74 @@ class TerminalTests(unittest.TestCase):
                          [(10, 0)] * 2 + [(10, 20)] * 2 + [(0, 20)] * 2 + [(0, 0)] * 2)
         self.assertEqual(len({p[b'i'] for p in placements}), 2)
 
+    def test_blink_switches_one_frame_without_retransmitting_pixels(self):
+        code, output, _ = self.with_png(compression=True, steps=[
+            (b'\t', 1), (b'\t', 2), (b' ', 2), (b' ', 2), (b'q', 0),
+        ])
+        self.assertEqual(code, 0)
+        self.assertIn(b'Blink', output)
+        headers = [dict(field.split(b'=', 1) for field in header.split(b','))
+                   for header in re.findall(rb'\x1b_G([^;]+);', output)]
+        uploads = [h for h in headers if h.get(b'a') in (b'T', b't')]
+        self.assertEqual(len(uploads), 5, 'blink retransmitted image pixels')
+        switches = [h for h in headers if h.get(b'a') == b'p']
+        before, after = uploads[-1][b'i'], uploads[-2][b'i']
+        self.assertEqual([(h[b'i'], h[b'z']) for h in switches],
+                         [(before, b'0'), (after, b'1'), (after, b'0'), (before, b'1')])
+        visible, fronts = {}, []
+        for token in re.finditer(rb'\x1b_G([^;]+);|\x1b\[\?2026l', output):
+            if token.group(1):
+                h = dict(field.split(b'=', 1) for field in token.group(1).split(b','))
+                if h.get(b'a') in (b'T', b'p'):
+                    visible[h[b'i']] = h
+                elif h.get(b'a') == b'd':
+                    visible.pop(h[b'i'], None)
+            elif before in visible and after in visible:
+                self.assertEqual(sorted(h[b'z'] for h in visible.values()), [b'0', b'1'])
+                self.assertEqual([(visible[before][k], visible[after][k])
+                                  for k in (b'x', b'y', b'w', b'h')],
+                                 [(b'0', b'0'), (b'0', b'0'), (b'1', b'1'), (b'1', b'1')])
+                fronts.append(next(i for i, h in visible.items() if h[b'z'] == b'1'))
+        self.assertEqual(fronts[:3], [before, after, before])
+        placements = re.findall(rb'\x1b\[(\d+);(\d+)H\x1b_G([^;]+);', output)
+        self.assertTrue(all((row, col) == (b'4', b'2')
+                            for row, col, header in placements if b'a=p,' in header))
+
+    def test_blink_auto_runs_and_space_pauses_it(self):
+        code, output, elapsed = self.with_png(compression=True, steps=[
+            (b'\t', 1), (b'\t', 2), (b'a', 2), (b' ', 2),
+            (.7, 0), (b'q', 0),
+        ])
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(elapsed, 1.2)
+        self.assertIn(b'Auto', output)
+        self.assertEqual(output.count(b'a=p,'), 4,
+                         'automatic switching continued after manual pause')
+        self.assertEqual(output.count(b'a=T,f=32') + output.count(b'a=t,f=32'), 5,
+                         'automatic switching retransmitted pixels')
+
+    def test_blink_pan_and_resize_preserve_the_selected_side(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'blink.png'
+            path.write_bytes(png(500, 300))
+            code, output, _ = self.run_pty([BINARY, str(path), str(path)],
+                compression=True, steps=[
+                    (b'\t', 1), (b'\t', 2), (b' ', 2), (b'1', 2),
+                    (b'l', 2), (b'j', 2), (b' ', 2),
+                    ((12, 49, 490, 240), 2), (b' ', 2), (b'q', 0),
+                ])
+        self.assertEqual(code, 0)
+        headers = [dict(field.split(b'=', 1) for field in header.split(b','))
+                   for header in re.findall(rb'\x1b_G([^;]+);', output)]
+        uploads = [h for h in headers if h.get(b'a') in (b'T', b't')]
+        self.assertEqual(len(uploads), 9, 'blink pan retransmitted image pixels')
+        switches = [h for h in headers if h.get(b'a') == b'p']
+        self.assertEqual([(h[b'x'], h[b'y']) for h in switches[2:8]],
+                         [(b'10', b'0')] * 2 + [(b'10', b'20')] * 4)
+        self.assertEqual(uploads[-1][b'z'], b'1', 'resize lost the selected Before side')
+        self.assertEqual(switches[-1][b'i'], uploads[-2][b'i'],
+                         'switch after resize used a discarded image')
+
     def test_resize_reuploads_both_images_when_viewport_pixels_are_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'resize.png'

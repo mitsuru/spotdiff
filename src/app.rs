@@ -1,13 +1,26 @@
-use crate::diff::Comparison;
+use crate::diff::{Comparison, Side};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Margin, Rect};
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 // Bound the rasterized viewport independently of the terminal window size.
 pub const MAX_IMAGE_CELLS: u16 = 297;
+const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     SideBySide,
     Highlight,
+    Blink,
+}
+impl Mode {
+    pub fn image_count(self) -> usize {
+        match self {
+            Self::SideBySide | Self::Blink => 2,
+            Self::Highlight => 1,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
@@ -33,6 +46,9 @@ pub struct App {
     area: Rect,
     cell: (u16, u16),
     generation: u64,
+    blink_after: bool,
+    blink_deadline: Option<Instant>,
+    display_revision: u64,
 }
 impl App {
     pub fn new(comparison: Arc<Comparison>) -> Self {
@@ -50,6 +66,9 @@ impl App {
             area: Rect::default(),
             cell: (1, 1),
             generation: 0,
+            blink_after: false,
+            blink_deadline: None,
+            display_revision: 0,
         }
     }
     pub fn resize(&mut self, area: Rect, cell_pixels: (u16, u16)) {
@@ -72,7 +91,7 @@ impl App {
                     let b = l.after.inner(Margin::new(1, 1));
                     Rect::new(0, 0, a.width.min(b.width), a.height.min(b.height))
                 }
-                Mode::Highlight => l.highlight.inner(Margin::new(1, 1)),
+                Mode::Highlight | Mode::Blink => l.highlight.inner(Margin::new(1, 1)),
             }
         };
         self.viewport.width = u32::from(size.width.min(MAX_IMAGE_CELLS)) * u32::from(self.cell.0);
@@ -99,6 +118,9 @@ impl App {
         );
     }
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
+        self.on_key_at(key, Instant::now())
+    }
+    pub fn on_key_at(&mut self, key: KeyEvent, now: Instant) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
@@ -108,13 +130,28 @@ impl App {
             return true;
         }
         let old = (self.mode, self.viewport);
+        let old_blink = (self.blink_after, self.blink_deadline);
         match key.code {
             KeyCode::Tab => {
                 self.mode = match self.mode {
                     Mode::SideBySide => Mode::Highlight,
-                    Mode::Highlight => Mode::SideBySide,
+                    Mode::Highlight => Mode::Blink,
+                    Mode::Blink => Mode::SideBySide,
                 };
+                self.blink_after = false;
+                self.blink_deadline = None;
                 self.update_dimensions();
+            }
+            KeyCode::Char(' ') if self.mode == Mode::Blink => {
+                self.blink_after = !self.blink_after;
+                self.blink_deadline = None;
+            }
+            KeyCode::Char('a') if self.mode == Mode::Blink => {
+                self.blink_deadline = if self.blink_deadline.is_some() {
+                    None
+                } else {
+                    Some(now + BLINK_INTERVAL)
+                };
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 self.fit = false;
@@ -150,7 +187,38 @@ impl App {
         if old != (self.mode, self.viewport) {
             self.generation += 1;
         }
+        if old_blink != (self.blink_after, self.blink_deadline) {
+            self.display_revision += 1;
+        }
         false
+    }
+    pub fn tick(&mut self, now: Instant) -> bool {
+        if self.blink_deadline.is_some_and(|deadline| now >= deadline) {
+            self.blink_after = !self.blink_after;
+            // Schedule from this flip instead of catching up missed intervals.
+            self.blink_deadline = Some(now + BLINK_INTERVAL);
+            self.display_revision += 1;
+            true
+        } else {
+            false
+        }
+    }
+    pub fn blink_timeout(&self, now: Instant) -> Option<Duration> {
+        self.blink_deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+    pub fn blink_side(&self) -> Side {
+        if self.blink_after {
+            Side::After
+        } else {
+            Side::Before
+        }
+    }
+    pub fn blink_auto(&self) -> bool {
+        self.blink_deadline.is_some()
+    }
+    pub fn display_revision(&self) -> u64 {
+        self.display_revision
     }
     pub fn viewport(&self) -> Viewport {
         self.viewport
@@ -286,6 +354,74 @@ mod tests {
             KeyModifiers::NONE,
             KeyEventKind::Release
         )));
+    }
+    #[test]
+    fn blink_uses_one_pane_and_switches_without_raster_changes() {
+        let mut a = app();
+        a.resize(Rect::new(0, 0, 24, 16), (10, 10));
+        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::Tab);
+        assert_eq!(a.mode(), Mode::Blink);
+        assert_eq!((a.viewport().width, a.viewport().height), (220, 100));
+        assert_eq!(a.blink_side(), crate::diff::Side::Before);
+        let generation = a.generation();
+        let revision = a.display_revision();
+        key(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.blink_side(), crate::diff::Side::After);
+        assert_eq!(a.generation(), generation);
+        assert!(a.display_revision() > revision);
+        key(&mut a, KeyCode::Tab);
+        assert_eq!(a.mode(), Mode::SideBySide);
+        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::Tab);
+        assert_eq!(a.blink_side(), crate::diff::Side::Before);
+        assert!(!a.blink_auto());
+    }
+    #[test]
+    fn blink_timer_and_pause_do_not_change_raster_generation() {
+        use std::time::{Duration, Instant};
+        let mut a = app();
+        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::Tab);
+        let now = Instant::now();
+        let auto = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        let generation = a.generation();
+        a.on_key_at(auto, now);
+        assert_eq!(a.blink_timeout(now), Some(Duration::from_millis(500)));
+        assert!(!a.tick(now + Duration::from_millis(499)));
+        assert!(a.tick(now + Duration::from_millis(500)));
+        assert_eq!(a.blink_side(), crate::diff::Side::After);
+        assert!(a.tick(now + Duration::from_secs(10)));
+        assert_eq!(a.blink_side(), crate::diff::Side::Before);
+        assert_eq!(
+            a.blink_timeout(now + Duration::from_secs(10)),
+            Some(Duration::from_millis(500))
+        );
+        a.on_key_at(auto, now + Duration::from_secs(10));
+        assert!(!a.blink_auto());
+        assert!(!a.tick(now + Duration::from_secs(20)));
+        a.on_key_at(auto, now + Duration::from_secs(20));
+        a.on_key_at(space, now + Duration::from_secs(20));
+        assert_eq!(a.blink_side(), crate::diff::Side::After);
+        assert_eq!(a.blink_timeout(now), None);
+        assert!(!a.tick(now + Duration::from_secs(30)));
+        assert_eq!(a.generation(), generation);
+    }
+    #[test]
+    fn blink_keys_are_ignored_in_other_modes_and_timer_stops_on_exit() {
+        use std::time::{Duration, Instant};
+        let mut a = app();
+        let now = Instant::now();
+        key(&mut a, KeyCode::Char('a'));
+        key(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.display_revision(), 0);
+        key(&mut a, KeyCode::Tab);
+        key(&mut a, KeyCode::Tab);
+        a.on_key_at(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), now);
+        key(&mut a, KeyCode::Tab);
+        assert!(!a.tick(now + Duration::from_secs(1)));
+        assert_eq!(a.blink_timeout(now), None);
     }
     #[test]
     fn tiny_layout_has_no_images() {
