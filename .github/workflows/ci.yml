@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  checks:
+    name: Rust and terminal checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Rust tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release binaries and test helper
+        run: cargo build --locked --release --bins --examples
+
+      - name: Run terminal PTY tests
+        run: python3 tests/terminal_pty.py target/release/spotdiff target/release/examples/terminal-failure
+
+      - name: Install lazygit
+        env:
+          LAZYGIT_VERSION: 0.65.0
+          LAZYGIT_SHA256: 44d8e7dd1484b4a66e191bd4ab25a71e8b4b3a65ab122f838e65677ef58c5506
+        run: |
+          archive="$RUNNER_TEMP/lazygit.tar.gz"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/jesseduffield/lazygit/releases/download/v${LAZYGIT_VERSION}/lazygit_${LAZYGIT_VERSION}_linux_x86_64.tar.gz"
+          printf '%s  %s\n' "$LAZYGIT_SHA256" "$archive" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/lazygit-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/lazygit-bin" lazygit
+          chmod +x "$RUNNER_TEMP/lazygit-bin/lazygit"
+          printf '%s\n' "$RUNNER_TEMP/lazygit-bin" >> "$GITHUB_PATH"
+
+      - name: Run lazygit integration PTY tests
+        run: |
+          lazygit --version
+          python3 tests/lazygit_pty.py target/release/spotdiff

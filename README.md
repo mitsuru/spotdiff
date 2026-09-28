@@ -1,5 +1,7 @@
 # spotdiff
 
+[![CI](https://github.com/mitsuru/spotdiff/actions/workflows/ci.yml/badge.svg)](https://github.com/mitsuru/spotdiff/actions/workflows/ci.yml)
+
 Rustで作るターミナル画像diffビューア。Kitty Graphics Protocolで画像を表示し、変更前後の左右比較、変更箇所の強調、1つの枠で交互に表示するBlinkモードを切り替えられます。
 
 lazygitで画像を選択して`I`を押すと全画面ビューアを開きます。`q`で終了し、lazygitの復帰プロンプトでEnterを押すと戻ります。
@@ -73,6 +75,8 @@ lazygitのdiffパネル内表示は将来の拡張です。初期版の連携は
 - 対話用TTYが必要です。画像制御列をファイルへリダイレクトして利用する形式ではありません。
 
 ## 開発と検証
+
+GitHub Actionsはmainへのpushとmainを対象とするPRで、Ubuntu 24.04・Rust 1.96.0を使ってfmt、Rustテスト、Clippy、releaseビルド、端末のPTYテストを実行します。lazygit 0.65.0を用意し、起動・復帰の連携テストも実行します。
 
 ```sh
 cargo fmt --check
