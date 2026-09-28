@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """PTY lifecycle tests. Terminal responses are simulated; no pixel rendering claim."""
 import fcntl
+import base64
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -24,7 +26,7 @@ def png(width=1, height=1):
     return b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!2I5B', width, height, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress((b'\x00' + b'\xff\x00\x00\xff' * width) * height)) + chunk(b'IEND', b'')
 
 class TerminalTests(unittest.TestCase):
-    def run_pty(self, args, respond=True, keys=None, steps=None):
+    def run_pty(self, args, respond=True, keys=None, steps=None, compression=None):
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 12, 48, 480, 240))
         initial = termios.tcgetattr(slave)
@@ -43,7 +45,11 @@ class TerminalTests(unittest.TestCase):
                 if select.select([master], [], [], .02)[0]:
                     output.extend(os.read(master, 65536))
                 if respond and not replied and b'\x1b[5n' in output:
-                    os.write(master, b'\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[0n')
+                    response = b'\x1b_Gi=31;OK\x1b\\'
+                    if b'\x1b_Gi=32' in output and compression is not None:
+                        response += (b'\x1b_Gi=32;OK\x1b\\' if compression
+                                     else b'\x1b_Gi=32;EINVAL: unsupported compression\x1b\\')
+                    os.write(master, response + b'\x1b[6;20;10t\x1b[0n')
                     replied = True
                     image_offset = len(output)
                 if keys is not None and not sent and b'Tab:' in output:
@@ -53,6 +59,8 @@ class TerminalTests(unittest.TestCase):
                     action, images = steps[step_index]
                     if isinstance(action, bytes):
                         os.write(master, action)
+                    elif isinstance(action, float):
+                        time.sleep(action)
                     else:
                         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', *action))
                     expected_images += images
@@ -90,18 +98,90 @@ class TerminalTests(unittest.TestCase):
                 code, _, _ = self.with_png(keys=key)
                 self.assertEqual(code, 0)
 
+    def test_images_are_directly_placed_inside_borders(self):
+        code, output, _ = self.with_png(steps=[(b'q', 0)], compression=True)
+        self.assertEqual(code, 0)
+        self.assertFalse(b'U=1' in output, 'virtual placements force Ghostty to rescan cells')
+        self.assertFalse('\U0010eeee'.encode() in output, 'image placeholders were emitted')
+        placements = re.findall(rb'\x1b\[(\d+);(\d+)H\x1b_G([^;]+);', output)
+        images = [(int(row), int(col), dict(field.split(b'=', 1) for field in header.split(b',')))
+                  for row, col, header in placements if b'a=T' in header]
+        self.assertEqual([(row, col) for row, col, _ in images], [(4, 2), (4, 26)])
+        for _, _, fields in images:
+            self.assertEqual((fields[b's'], fields[b'v'], fields[b'C']), (b'1', b'1', b'1'))
+            self.assertNotIn(b'c', fields, 'cropped image was stretched to fill the pane')
+            self.assertNotIn(b'r', fields, 'cropped image was stretched to fill the pane')
+
+    def test_image_updates_are_synchronized_and_idle_does_not_redraw(self):
+        code, output, _ = self.with_png(steps=[(.2, 0), (b'q', 0)], compression=True)
+        self.assertEqual(code, 0)
+        active, images, frames = False, 0, 0
+        for match in re.finditer(rb'\x1b\[\?2026([hl])|\x1b_G[^;]*a=T[^;]*;', output):
+            if match.group(1) == b'h':
+                self.assertFalse(active, 'nested synchronized update')
+                active, frames = True, frames + 1
+            elif match.group(1) == b'l':
+                active = False
+            else:
+                self.assertTrue(active, 'image sent outside synchronized update')
+                images += 1
+        self.assertEqual(images, 2)
+        self.assertFalse(active, 'terminal left in synchronized update mode')
+        self.assertLessEqual(frames, 2, 'unchanged screen was redrawn while idle')
+
+    def test_negotiated_compression_reduces_bytes_without_changing_pixels(self):
+        def images(output):
+            result, payload, metadata = [], bytearray(), None
+            for header, data in re.findall(rb'\x1b_G([^;\x1b]+);([^\x1b]*)\x1b\\', output):
+                fields = dict(item.split(b'=', 1) for item in header.split(b','))
+                if fields.get(b'a') == b'T':
+                    metadata, payload = fields, bytearray()
+                if metadata is None or not data:
+                    continue
+                payload.extend(base64.b64decode(data))
+                if fields.get(b'm', b'0') == b'0':
+                    raw = zlib.decompress(payload) if metadata.get(b'o') == b'z' else bytes(payload)
+                    result.append((int(metadata[b's']), int(metadata[b'v']), raw))
+                    metadata = None
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'compression.png'
+            path.write_bytes(png(500, 300))
+            compressed_run = self.run_pty([BINARY, str(path), str(path)], steps=[(b'q', 0)], compression=True)
+            raw_runs = [(capability, self.run_pty([BINARY, str(path), str(path)], steps=[(b'q', 0)], compression=capability))
+                        for capability in (False, None)]
+        code, compressed, _ = compressed_run
+        self.assertEqual(code, 0)
+        self.assertTrue(b'i=32,s=1,v=1,a=q,t=d,f=24,o=z;' in compressed,
+                        'compression support was not queried')
+        self.assertTrue(re.search(rb'a=T,f=32,o=z,t=d', compressed),
+                        'supported compression was not used')
+        compressed_images = images(compressed)
+        self.assertEqual(len(compressed_images), 2)
+        for capability, (code, raw, _) in raw_runs:
+            with self.subTest(compression=capability):
+                self.assertEqual(code, 0)
+                self.assertFalse(re.search(rb'a=T,f=32,o=z,t=d', raw),
+                                 'compression used without a positive response')
+                self.assertEqual(images(raw), compressed_images)
+                self.assertLess(len(compressed), len(raw) / 8)
+
     def test_zoom_mode_and_resize_then_quit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'a.png'
             path.write_bytes(png(500, 300))
-            code, output, _ = self.run_pty([BINARY, str(path), str(path)], steps=[
-                (b'+', 2), (b'l', 2), (b'j', 2), (b'\t', 1),
-                (b'+', 1), (b'f', 1), (b'1', 1),
-                ((10, 40, 400, 200), 1), (b'+', 1),
-                ((16, 60, 600, 320), 1), (b'q', 0),
-            ])
-            self.assertEqual(code, 0)
-            self.assertEqual(output.count(b'a=T,U=1'), 15)
+            for compression in (False, True):
+                with self.subTest(compression=compression):
+                    code, output, _ = self.run_pty([BINARY, str(path), str(path)],
+                        compression=compression, steps=[
+                        (b'+', 2), (b'l', 2), (b'j', 2), (b'\t', 1),
+                        (b'+', 1), (b'f', 1), (b'1', 1),
+                        ((10, 40, 400, 200), 1), (b'+', 1),
+                        ((16, 60, 600, 320), 1), (b'q', 0),
+                    ])
+                    self.assertEqual(code, 0)
+                    self.assertEqual(output.count(b'a=T,f=32'), 15)
 
     def test_non_regular_inputs_fail_before_terminal_setup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -114,7 +194,7 @@ class TerminalTests(unittest.TestCase):
                     result = subprocess.run(args, cwd=directory, stdin=subprocess.DEVNULL,
                                             capture_output=True, timeout=2)
                     self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('通常ファイル'.encode(), result.stderr)
+                    self.assertIn(b'regular files', result.stderr)
                     self.assertNotIn(b'\x1b', result.stdout)
 
     @unittest.skipUnless(HELPER, 'pass the test helper binary to cover error and panic')
@@ -123,6 +203,10 @@ class TerminalTests(unittest.TestCase):
             code, output, _ = self.run_pty([HELPER, mode])
             self.assertNotEqual(code, 0)
             self.assertIn(('test ' + mode).encode(), output)
+            self.assertTrue(b'\x1b[?2026h' in output)
+            self.assertTrue(b'\x1b[?2026l' in output)
+            self.assertLess(output.index(b'\x1b[?2026l'), output.index(b'\x1b[?1049l'),
+                            'synchronized update was not ended before leaving the screen')
 
 if __name__ == '__main__':
     unittest.main()

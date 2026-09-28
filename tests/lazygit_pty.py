@@ -88,7 +88,7 @@ class LazygitTests(unittest.TestCase):
                         os.write(master, b'2' + key)
                         phase, offset = 'starting spotdiff', len(output)
                     if not replied and b'\x1b_Gi=31' in output and b'\x1b[5n' in output:
-                        os.write(master, b'\x1b_Gi=31;OK\x1b\\\x1b[6;20;10t\x1b[0n')
+                        os.write(master, b'\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;OK\x1b\\\x1b[6;20;10t\x1b[0n')
                         replied = True
                         image_offset = len(output)
                     if phase == 'starting spotdiff' and replied and output[image_offset:].count(b'm=0;') >= 2:

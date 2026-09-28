@@ -1,3 +1,4 @@
+mod kitty;
 pub mod worker;
 use crate::{
     app::{self, App, Mode, Viewport},
@@ -5,16 +6,13 @@ use crate::{
     source::SourcePair,
 };
 use anyhow::ensure;
-use image::{DynamicImage, RgbaImage};
+use image::RgbaImage;
+use kitty::KittyImage;
 use ratatui::{
     Frame,
     layout::{Margin, Size},
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph},
-};
-use ratatui_image::{
-    Image,
-    protocol::{Protocol, kitty::Kitty},
 };
 #[derive(Clone)]
 pub struct RenderRequest {
@@ -22,13 +20,14 @@ pub struct RenderRequest {
     pub mode: Mode,
     pub viewport: Viewport,
     pub cell_pixels: (u16, u16),
+    pub compress: bool,
     pub image_ids: Vec<u32>,
 }
 pub struct PreparedFrame {
     pub generation: u64,
-    pub before: Option<Protocol>,
-    pub after: Option<Protocol>,
-    pub highlight: Option<Protocol>,
+    pub before: Option<KittyImage>,
+    pub after: Option<KittyImage>,
+    pub highlight: Option<KittyImage>,
     pub image_ids: Vec<u32>,
 }
 
@@ -42,26 +41,36 @@ pub fn rasterize_viewport(c: &Comparison, side: Side, v: &Viewport) -> RgbaImage
 pub fn prepare(c: &Comparison, r: &RenderRequest) -> anyhow::Result<PreparedFrame> {
     ensure!(
         r.cell_pixels.0 > 0 && r.cell_pixels.1 > 0,
-        "端末の文字セル寸法が不正です"
+        "Invalid terminal cell dimensions"
     );
     ensure!(
         r.viewport.zoom.is_finite() && r.viewport.zoom > 0.0,
-        "画像の倍率が不正です"
+        "Invalid image zoom"
     );
     diff::validate_rgba_size(r.viewport.width, r.viewport.height)?;
     let required = if r.mode == Mode::SideBySide { 2 } else { 1 };
-    ensure!(r.image_ids.len() == required, "画像IDが不足しています");
+    ensure!(r.image_ids.len() == required, "Not enough image IDs");
     let size = Size::new(
         (r.viewport.width / u32::from(r.cell_pixels.0)).try_into()?,
         (r.viewport.height / u32::from(r.cell_pixels.1)).try_into()?,
     );
     ensure!(
         size.width <= app::MAX_IMAGE_CELLS && size.height <= app::MAX_IMAGE_CELLS,
-        "Kittyの描画可能なセル数を超えています"
+        "Display area exceeds the cell count limit"
     );
-    let make = |side: Side, id: u32| -> anyhow::Result<Protocol> {
-        let image = DynamicImage::ImageRgba8(rasterize_viewport(c, side, &r.viewport));
-        Ok(Protocol::Kitty(Kitty::new(image, size, id, false, false)?))
+    let visible =
+        Viewport {
+            width: r.viewport.width.min(
+                ((f64::from(c.width) - r.viewport.x).max(0.0) * r.viewport.zoom).ceil() as u32,
+            ),
+            height: r.viewport.height.min(
+                ((f64::from(c.height) - r.viewport.y).max(0.0) * r.viewport.zoom).ceil() as u32,
+            ),
+            ..r.viewport
+        };
+    diff::validate_rgba_size(visible.width, visible.height)?;
+    let make = |side: Side, id: u32| -> anyhow::Result<KittyImage> {
+        KittyImage::new(rasterize_viewport(c, side, &visible), size, id, r.compress)
     };
     let mut p = PreparedFrame {
         generation: r.generation,
@@ -111,7 +120,7 @@ impl Renderer {
         let dimensions = |side: &Option<std::sync::Arc<RgbaImage>>| {
             side.as_ref()
                 .map(|i| format!("{}×{}", i.width(), i.height()))
-                .unwrap_or_else(|| "画像なし".into())
+                .unwrap_or_else(|| "No image".into())
         };
         let header = format!(
             "spotdiff  {} → {}\n{} ({}) → {} ({})",
@@ -127,9 +136,9 @@ impl Renderer {
             l.header,
         );
         let mode = if a.mode() == Mode::SideBySide {
-            "左右比較"
+            "Side by side"
         } else {
-            "差分強調"
+            "Highlight"
         };
         let ratio = if c.compared == 0 {
             0.0
@@ -137,7 +146,7 @@ impl Renderer {
             c.changed as f64 / c.compared as f64 * 100.0
         };
         let footer = format!(
-            "{mode}  {:.1}%  変更: {} / {} px ({ratio:.2}%)\nTab:表示 +/−:ズーム hjkl/矢印:移動 f:fit 1:等倍 q:終了",
+            "{mode}  {:.1}%  Changed: {} / {} px ({ratio:.2}%)\nTab:mode +/-:zoom hjkl/arrows:pan f:fit 1:actual q:quit",
             a.viewport().zoom * 100.0,
             c.changed,
             c.compared
@@ -145,7 +154,7 @@ impl Renderer {
         f.render_widget(Paragraph::new(footer), l.footer);
         if l.too_small {
             f.render_widget(
-                Paragraph::new("ウィンドウを広げてください（qで終了）"),
+                Paragraph::new("Enlarge the window (q to quit)"),
                 l.highlight,
             );
             return;
@@ -153,40 +162,67 @@ impl Renderer {
         let p = p.filter(|p| is_current(a.generation(), p.generation));
         let mut image = |area: ratatui::layout::Rect,
                          title: &str,
-                         protocol: Option<&Protocol>,
+                         protocol: Option<&KittyImage>,
                          missing: Option<&str>| {
             f.render_widget(Block::default().borders(Borders::ALL).title(title), area);
             let inner = area.inner(Margin::new(1, 1));
             if let Some(text) = missing {
                 f.render_widget(Paragraph::new(text), inner);
-            } else if let Some(protocol) = protocol {
-                f.render_widget(Image::new(protocol).allow_clipping(true), inner);
-            } else {
-                f.render_widget(Paragraph::new("描画を更新中…"), inner);
+            } else if protocol.is_none() {
+                f.render_widget(Paragraph::new("Rendering..."), inner);
             }
         };
         match a.mode() {
             Mode::SideBySide => {
                 image(
                     l.before,
-                    "変更前",
+                    "Before",
                     p.and_then(|p| p.before.as_ref()),
-                    c.before.is_none().then_some("追加前の画像なし"),
+                    c.before.is_none().then_some("No image before addition"),
                 );
                 image(
                     l.after,
-                    "変更後",
+                    "After",
                     p.and_then(|p| p.after.as_ref()),
-                    c.after.is_none().then_some("削除後の画像なし"),
+                    c.after.is_none().then_some("No image after deletion"),
                 );
             }
             Mode::Highlight => image(
                 l.highlight,
-                "変更箇所（マゼンタ）",
+                "Changes (magenta)",
                 p.and_then(|p| p.highlight.as_ref()),
                 None,
             ),
         }
+    }
+
+    pub fn write_images(
+        out: &mut impl std::io::Write,
+        area: ratatui::layout::Rect,
+        app: &App,
+        prepared: &mut PreparedFrame,
+    ) -> anyhow::Result<()> {
+        if !is_current(app.generation(), prepared.generation) {
+            return Ok(());
+        }
+        let l = app::layout(area, app.mode());
+        if l.too_small {
+            return Ok(());
+        }
+        let mut write = |image: &mut Option<KittyImage>, area: ratatui::layout::Rect| {
+            if let Some(image) = image {
+                image.write(out, area.inner(Margin::new(1, 1)))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        match app.mode() {
+            Mode::SideBySide => {
+                write(&mut prepared.before, l.before)?;
+                write(&mut prepared.after, l.after)?;
+            }
+            Mode::Highlight => write(&mut prepared.highlight, l.highlight)?,
+        }
+        Ok(())
     }
 }
 #[cfg(test)]
@@ -195,11 +231,7 @@ mod tests {
     use crate::diff::compare;
     use crate::source::InputSide;
     use image::Rgba;
-    use ratatui::{
-        Terminal,
-        backend::{CrosstermBackend, TestBackend},
-        layout::Rect,
-    };
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::sync::Arc;
     fn comparison() -> Comparison {
         let mut i = RgbaImage::from_pixel(3, 1, Rgba([255, 0, 0, 255]));
@@ -229,6 +261,61 @@ mod tests {
             },
         );
         assert_eq!(out.dimensions(), (1, 1));
+    }
+    #[test]
+    fn small_canvas_is_not_padded_to_the_whole_pane() {
+        let c = comparison();
+        let r = RenderRequest {
+            generation: 1,
+            mode: Mode::Highlight,
+            viewport: Viewport {
+                zoom: 2.0,
+                x: 0.0,
+                y: 0.0,
+                width: 100,
+                height: 100,
+            },
+            cell_pixels: (10, 20),
+            compress: false,
+            image_ids: vec![4242],
+        };
+        let mut p = prepare(&c, &r).unwrap();
+        let mut out = Vec::new();
+        p.highlight
+            .as_mut()
+            .unwrap()
+            .write(&mut out, Rect::new(0, 0, 10, 5))
+            .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        // The comparison canvas is 3x1; 2x zoom needs only a 6x2 texture.
+        assert!(
+            text.contains("s=6,v=2,"),
+            "pane-sized texture was transmitted"
+        );
+        assert!(
+            !text.contains("c=10,r=5"),
+            "cropped image was stretched to fill the pane"
+        );
+        let apc = text.split_once("\x1b_G").unwrap().1;
+        let payload = apc
+            .split_once(';')
+            .unwrap()
+            .1
+            .strip_suffix("\x1b\\")
+            .unwrap();
+        let pixels = base64_simd::STANDARD
+            .decode_to_vec(payload.as_bytes())
+            .unwrap();
+        let row = [
+            [255, 0, 127, 255],
+            [255, 0, 127, 255],
+            [255, 0, 127, 255],
+            [255, 0, 127, 255],
+            [127, 127, 127, 255],
+            [127, 127, 127, 255],
+        ]
+        .concat();
+        assert_eq!(pixels, [row.clone(), row].concat());
     }
     #[test]
     fn delayed_success_and_error_do_not_replace_latest_frame() {
@@ -285,12 +372,16 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>()
             .replace(' ', "");
-        assert!(text.contains("追加前の画像なし"));
+        assert!(text.contains("Noimagebeforeaddition"));
         assert!(text.contains("日本語.png"));
     }
     #[test]
     fn kitty_image_ids_and_chunks() {
-        let c = comparison();
+        let c = compare(
+            None,
+            Some(RgbaImage::from_pixel(128, 128, Rgba([255, 0, 0, 255]))),
+        )
+        .unwrap();
         let r = RenderRequest {
             generation: 1,
             mode: Mode::Highlight,
@@ -302,26 +393,13 @@ mod tests {
                 height: 100,
             },
             cell_pixels: (10, 20),
+            compress: false,
             image_ids: vec![4242],
         };
         let mut p = prepare(&c, &r).unwrap();
-        let protocol = p.highlight.take().unwrap();
+        let mut protocol = p.highlight.take().unwrap();
         let mut out = Vec::new();
-        {
-            let mut backend = CrosstermBackend::new(&mut out);
-            use ratatui::backend::Backend;
-            let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 5));
-            use ratatui::widgets::Widget;
-            ratatui_image::Image::new(&protocol).render(buf.area, &mut buf);
-            backend
-                .draw(
-                    buf.content
-                        .iter()
-                        .enumerate()
-                        .map(|(i, c)| ((i % 10) as u16, (i / 10) as u16, c)),
-                )
-                .unwrap();
-        }
+        protocol.write(&mut out, Rect::new(0, 0, 10, 5)).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("i=4242"));
         assert!(text.contains("m=1"));

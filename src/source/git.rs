@@ -15,13 +15,13 @@ fn command(root: &Path, args: &[&OsStr]) -> anyhow::Result<Output> {
         .arg("--literal-pathspecs")
         .args(args)
         .output()
-        .context("Gitを実行できません")
+        .context("Failed to run Git")
 }
 fn checked(root: &Path, args: &[&OsStr]) -> anyhow::Result<Vec<u8>> {
     let out = command(root, args)?;
     ensure!(
         out.status.success(),
-        "Git取得エラー: {}",
+        "Git read failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
     Ok(out.stdout)
@@ -33,11 +33,11 @@ fn resolve_missing(path: &Path) -> anyhow::Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(p) => Ok(p),
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            let parent = path.parent().context("画像パスの親がありません")?;
-            let name = path.file_name().context("画像ファイル名がありません")?;
+            let parent = path.parent().context("Image path has no parent")?;
+            let name = path.file_name().context("Image path has no file name")?;
             Ok(resolve_missing(parent)?.join(name))
         }
-        Err(e) => Err(e).with_context(|| format!("パスを解決できません: {}", path.display())),
+        Err(e) => Err(e).with_context(|| format!("Failed to resolve path: {}", path.display())),
     }
 }
 #[cfg(unix)]
@@ -75,20 +75,20 @@ fn object(root: &Path, path: &Path, head: bool) -> anyhow::Result<Option<Vec<u8>
         let tab = record
             .iter()
             .position(|b| *b == b'\t')
-            .context("Gitのファイル情報を解析できません")?;
+            .context("Failed to parse Git file metadata")?;
         if &record[tab + 1..] != bytes(path) {
             continue;
         }
         let fields: Vec<_> = record[..tab].split(|b| *b == b' ').collect();
-        ensure!(fields.len() == 3, "Gitのファイル情報が不正です");
+        ensure!(fields.len() == 3, "Invalid Git file metadata");
         ensure!(
             fields[0] == b"100644" || fields[0] == b"100755",
-            "Gitの比較対象は通常ファイルに限ります"
+            "Git image inputs must be regular files"
         );
         if !head {
             ensure!(
                 fields[2] == b"0",
-                "画像がmerge conflict中です。競合を解決してください"
+                "Image has a merge conflict. Resolve the conflict first"
             );
         }
         let oid = if head { fields[2] } else { fields[1] };
@@ -132,7 +132,7 @@ fn has_head(root: &Path) -> anyhow::Result<bool> {
         return Ok(true);
     }
     let symbolic = command(root, &strings(&["symbolic-ref", "-q", "HEAD"]))?;
-    ensure!(symbolic.status.success(), "Git HEADが不正です");
+    ensure!(symbolic.status.success(), "Invalid Git HEAD");
     let mut name = symbolic.stdout;
     if name.last() == Some(&b'\n') {
         name.pop();
@@ -149,7 +149,7 @@ fn has_head(root: &Path) -> anyhow::Result<bool> {
     )?;
     ensure!(
         reference.status.code() == Some(1),
-        "Git HEADの参照先が破損しています"
+        "Git HEAD reference is corrupt"
     );
     Ok(false)
 }
@@ -170,13 +170,13 @@ pub(super) fn load(path: &Path, staged: bool, cwd: &Path) -> anyhow::Result<Sour
     if let Ok(meta) = fs::symlink_metadata(&absolute) {
         ensure!(
             !meta.file_type().is_symlink(),
-            "シンボリックリンクは画像比較の対象外です"
+            "Symbolic links are not supported for image comparison"
         );
     }
     let absolute = resolve_missing(&absolute)?;
     let relative = absolute
         .strip_prefix(&root)
-        .context("Gitリポジトリ外の画像は比較できません")?;
+        .context("Cannot compare images outside the Git repository")?;
     let index = object(&root, relative, false)?;
     let (before, after) = if staged {
         let head = if has_head(&root)? {
@@ -203,7 +203,7 @@ pub(super) fn load(path: &Path, staged: bool, cwd: &Path) -> anyhow::Result<Sour
             {
                 None
             }
-            Err(e) => return Err(e).context("Git作業ツリーの画像を読み込めません"),
+            Err(e) => return Err(e).context("Failed to read image from the Git working tree"),
         };
         (
             InputSide {
@@ -217,7 +217,10 @@ pub(super) fn load(path: &Path, staged: bool, cwd: &Path) -> anyhow::Result<Sour
         )
     };
     if before.bytes.is_none() && after.bytes.is_none() {
-        bail!("Gitの両側に画像がありません: {}", path.display());
+        bail!(
+            "No image on either side of the Git comparison: {}",
+            path.display()
+        );
     }
     Ok(SourcePair { before, after })
 }

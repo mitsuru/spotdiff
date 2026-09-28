@@ -15,7 +15,7 @@ pub struct SourcePair {
 fn read_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     ensure!(
         fs::metadata(path)?.is_file(),
-        "画像の入力は通常ファイルに限ります: {}",
+        "Image inputs must be regular files: {}",
         path.display()
     );
     Ok(fs::read(path)?)
@@ -28,7 +28,7 @@ pub fn load(request: &Request, cwd: &Path) -> anyhow::Result<SourcePair> {
                     label: path.display().to_string(),
                     bytes: Some(
                         read_regular_file(&cwd.join(path))
-                            .with_context(|| format!("画像を読み込めません: {}", path.display()))?,
+                            .with_context(|| format!("Failed to read image: {}", path.display()))?,
                     ),
                 })
             };

@@ -9,7 +9,11 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
     use crossterm::event::{self, Event};
     use ratatui::{Terminal, backend::CrosstermBackend};
     use render::{PreparedFrame, RenderRequest, Renderer, worker::Worker};
-    use std::{io, sync::Arc, time::Duration};
+    use std::{
+        io::{self, Write},
+        sync::Arc,
+        time::Duration,
+    };
     let labels = source::load(&request, &std::env::current_dir()?)?;
     let before = labels
         .before
@@ -26,9 +30,16 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
     let comparison = Arc::new(diff::compare(before, after)?);
     let mut session = terminal::Session::enter()?;
     let result = (|| -> anyhow::Result<()> {
-        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::BufWriter::with_capacity(
+            64 * 1024,
+            io::stdout(),
+        )))?;
         let font = session.picker().font_size();
         let cell = (font.width, font.height);
+        let compress = session
+            .picker()
+            .capabilities()
+            .contains(&ratatui_image::picker::Capability::KittyCompression);
         let worker = Worker::spawn(comparison.clone());
         let mut app = app::App::new(comparison);
         let mut prepared: Option<PreparedFrame> = None;
@@ -36,14 +47,13 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
         let mut submitted = None;
         loop {
             let size = terminal.size()?;
-            app.resize(
-                ratatui::layout::Rect::new(0, 0, size.width, size.height),
-                cell,
-            );
+            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            app.resize(area, cell);
+            let mut dirty = false;
+            let mut retired_ids = Vec::new();
             if submitted != Some(app.generation()) {
-                if let Some(old) = prepared.take() {
-                    session.delete_ids(&old.image_ids)?;
-                }
+                // Pending images have not been sent. Keep the visible frame until
+                // its replacement is ready, so an operation doesn't flash blank.
                 session.delete_ids(&pending_ids)?;
                 pending_ids.clear();
                 submitted = Some(app.generation());
@@ -59,18 +69,40 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
                         mode: app.mode(),
                         viewport,
                         cell_pixels: cell,
+                        compress,
                         image_ids: pending_ids.clone(),
                     })?;
+                    dirty = prepared.is_none();
+                } else {
+                    if let Some(old) = prepared.take() {
+                        retired_ids.extend(old.image_ids);
+                    }
+                    dirty = true;
                 }
             }
             if let Some((generation, result)) = worker.poll()
                 && let Some(frame) = render::accept_result(app.generation(), generation, result)?
             {
-                prepared = Some(frame);
+                if let Some(old) = prepared.replace(frame) {
+                    retired_ids.extend(old.image_ids);
+                }
                 pending_ids.clear();
+                dirty = true;
             }
-            terminal.draw(|f| Renderer::draw(f, &app, prepared.as_ref(), &labels))?;
-            if event::poll(Duration::from_millis(50))? {
+            if dirty {
+                session.begin_update()?;
+                session.delete_ids(&retired_ids)?;
+                terminal.draw(|f| Renderer::draw(f, &app, prepared.as_ref(), &labels))?;
+                if let Some(frame) = prepared.as_mut() {
+                    Renderer::write_images(terminal.backend_mut(), area, &app, frame)?;
+                    terminal.backend_mut().flush()?;
+                }
+                session.end_update()?;
+            }
+            // Poll input frequently only while an asynchronous frame is pending.
+            // Completed frames otherwise waited for the full 50ms idle timeout.
+            let timeout = if pending_ids.is_empty() { 50 } else { 4 };
+            if event::poll(Duration::from_millis(timeout))? {
                 let mut quit = false;
                 loop {
                     if let Event::Key(key) = event::read()?

@@ -2,9 +2,12 @@ use anyhow::{Context, ensure};
 use crossterm::{
     cursor::{Hide, Show},
     execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
-use ratatui_image::picker::{Capability, Picker, ProtocolType};
+use ratatui_image::picker::{Capability, Picker, ProtocolType, cap_parser::QueryStdioOptions};
 use std::{
     collections::HashSet,
     io::{self, IsTerminal, Write},
@@ -22,6 +25,7 @@ struct Cleanup {
     done: AtomicBool,
     raw: AtomicBool,
     alternate: AtomicBool,
+    synchronized: AtomicBool,
     ids: Mutex<HashSet<u32>>,
 }
 pub struct Session {
@@ -41,6 +45,11 @@ fn restore(c: &Cleanup) -> anyhow::Result<()> {
         .drain()
         .collect();
     let mut out = io::stdout();
+    let synchronized = if c.synchronized.swap(false, Ordering::SeqCst) {
+        execute!(out, EndSynchronizedUpdate)
+    } else {
+        Ok(())
+    };
     let deleted = out.write_all(&delete_commands(&ids));
     let screen = if c.alternate.swap(false, Ordering::SeqCst) {
         execute!(out, LeaveAlternateScreen, Show)
@@ -52,24 +61,29 @@ fn restore(c: &Cleanup) -> anyhow::Result<()> {
     } else {
         Ok(())
     };
-    deleted.and(screen).and(raw).context("端末を復元できません")
+    synchronized
+        .and(deleted)
+        .and(screen)
+        .and(raw)
+        .context("Failed to restore terminal state")
 }
 impl Session {
     pub fn enter() -> anyhow::Result<Self> {
         ensure!(
             io::stdin().is_terminal() && io::stdout().is_terminal(),
-            "TTYで実行してください（stdin・stdoutが端末である必要があります）"
+            "Run in a TTY (stdin and stdout must be terminals)"
         );
         // Picker enables tmux passthrough as a side effect. Avoid modifying it in this version.
         ensure!(
             !std::env::var("TERM").is_ok_and(|t| t.starts_with("tmux") || t.starts_with("screen"))
                 && !std::env::var("TERM_PROGRAM").is_ok_and(|t| t == "tmux"),
-            "初期版はtmux外のKitty対応端末で実行してください"
+            "Run in a terminal supporting the Kitty Graphics Protocol, outside tmux or screen"
         );
         let cleanup = Arc::new(Cleanup {
             done: AtomicBool::new(false),
             raw: AtomicBool::new(false),
             alternate: AtomicBool::new(false),
+            synchronized: AtomicBool::new(false),
             ids: Mutex::new(HashSet::new()),
         });
         let previous: Hook = panic::take_hook().into();
@@ -97,11 +111,14 @@ impl Session {
         // The library resets its timeout after every byte; impose a whole-query deadline as well.
         let (tx, rx) = mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = tx.send(Picker::from_query_stdio());
+            let _ = tx.send(Picker::from_query_stdio_with_options(QueryStdioOptions {
+                kitty_compression: true,
+                ..QueryStdioOptions::default()
+            }));
         });
         let picker = rx
             .recv_timeout(Duration::from_secs(3))
-            .context("Kitty端末の問い合わせがタイムアウトしました")??;
+            .context("Kitty terminal capability query timed out")??;
         validate_picker(&picker)?;
         session.picker = Some(picker);
         Ok(session)
@@ -122,6 +139,16 @@ impl Session {
             }
         }
         result
+    }
+    pub fn begin_update(&self) -> anyhow::Result<()> {
+        self.cleanup.synchronized.store(true, Ordering::SeqCst);
+        execute!(io::stdout(), BeginSynchronizedUpdate)?;
+        Ok(())
+    }
+    pub fn end_update(&self) -> anyhow::Result<()> {
+        execute!(io::stdout(), EndSynchronizedUpdate)?;
+        self.cleanup.synchronized.store(false, Ordering::SeqCst);
+        Ok(())
     }
     pub fn delete_ids(&mut self, ids: &[u32]) -> anyhow::Result<()> {
         let owned: Vec<_> = {
@@ -155,12 +182,12 @@ impl Drop for Session {
 pub fn validate_picker(p: &Picker) -> anyhow::Result<()> {
     ensure!(
         p.protocol_type() == ProtocolType::Kitty && p.capabilities().contains(&Capability::Kitty),
-        "Kitty Graphics Protocolの対応を確認できません。Kitty対応端末で実行してください"
+        "Could not confirm Kitty Graphics Protocol support. Use a compatible terminal"
     );
     let size = p.font_size();
     ensure!(
         size.width > 0 && size.height > 0,
-        "端末の文字セル寸法が不正です"
+        "Invalid terminal cell dimensions"
     );
     Ok(())
 }

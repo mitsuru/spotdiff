@@ -2,7 +2,7 @@ use crate::diff::Comparison;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Margin, Rect};
 use std::sync::Arc;
-// ratatui-image 11.1 uses 297 diacritics for Kitty row/column placeholders.
+// Bound the rasterized viewport independently of the terminal window size.
 pub const MAX_IMAGE_CELLS: u16 = 297;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -53,11 +53,11 @@ impl App {
         }
     }
     pub fn resize(&mut self, area: Rect, cell_pixels: (u16, u16)) {
-        let old = self.viewport;
+        let old = (self.area, self.cell, self.viewport);
         self.area = area;
         self.cell = cell_pixels;
         self.update_dimensions();
-        if old != self.viewport {
+        if old != (self.area, self.cell, self.viewport) {
             self.generation += 1;
         }
     }
@@ -218,6 +218,17 @@ mod tests {
         assert_eq!((a.viewport().width, a.viewport().height), (100, 100));
         a.resize(Rect::new(0, 0, 24, 16), (5, 5));
         assert_eq!(a.viewport().zoom, 0.5);
+    }
+    #[test]
+    fn resize_updates_placements_even_when_viewport_pixels_do_not_change() {
+        let mut a = app();
+        a.resize(Rect::new(0, 0, 24, 16), (10, 10));
+        let generation = a.generation();
+        let viewport = a.viewport();
+        // The narrower pane has the same size, but the right border moves.
+        a.resize(Rect::new(0, 0, 25, 16), (10, 10));
+        assert_eq!(a.viewport(), viewport);
+        assert!(a.generation() > generation);
     }
     #[test]
     fn zoom_is_bounded() {

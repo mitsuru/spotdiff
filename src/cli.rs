@@ -13,18 +13,24 @@ pub enum Request {
 #[command(
     name = "spotdiff",
     version,
-    about = "Kitty Graphics Protocolで画像を比較",
+    about = "Compare images using the Kitty Graphics Protocol",
     override_usage = "spotdiff <BEFORE> <AFTER>\n       spotdiff git [--staged] -- <PATH>"
 )]
 struct Files {
+    #[arg(help = "Image before the change")]
     before: PathBuf,
+    #[arg(help = "Image after the change")]
     after: PathBuf,
 }
 #[derive(Parser)]
-#[command(name = "spotdiff git", about = "Gitの画像変更を比較")]
+#[command(name = "spotdiff git", about = "Compare image changes in Git")]
 struct Git {
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Compare HEAD with the index instead of the index with the working tree"
+    )]
     staged: bool,
+    #[arg(help = "Image path in the Git repository")]
     path: PathBuf,
 }
 

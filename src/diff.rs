@@ -26,7 +26,7 @@ pub fn validate_rgba_size(width: u32, height: u32) -> anyhow::Result<()> {
         .and_then(|n| n.checked_mul(4));
     ensure!(
         width > 0 && height > 0 && bytes.is_some_and(|n| n <= MAX_RGBA_BYTES),
-        "画像のRGBAサイズが256 MiBの制限を超えています（または寸法が不正です）"
+        "Image RGBA size exceeds the 256 MiB limit, or dimensions are invalid"
     );
     Ok(())
 }
@@ -34,16 +34,16 @@ pub fn decode(bytes: &[u8], label: &str) -> anyhow::Result<RgbaImage> {
     let decode_inner = || -> anyhow::Result<RgbaImage> {
         ensure!(
             !bytes.starts_with(b"version https://git-lfs.github.com/spec/v1"),
-            "Git LFSポインタの画像展開には対応していません"
+            "Git LFS pointer expansion is not supported"
         );
         let format = image::guess_format(bytes)
-            .context("画像形式を判定できません。PNG・JPEG・WebPに対応しています")?;
+            .context("Could not detect image format. Supported formats: PNG, JPEG, WebP")?;
         ensure!(
             matches!(
                 format,
                 ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
             ),
-            "PNG・JPEG・WebP以外の形式は未対応です"
+            "Unsupported image format. Supported formats: PNG, JPEG, WebP"
         );
         let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
         let mut limits = Limits::default();
@@ -54,13 +54,10 @@ pub fn decode(bytes: &[u8], label: &str) -> anyhow::Result<RgbaImage> {
         validate_rgba_size(w, h)?;
         Ok(DynamicImage::from_decoder(decoder)?.into_rgba8())
     };
-    decode_inner().with_context(|| format!("画像をデコードできません: {label}"))
+    decode_inner().with_context(|| format!("Failed to decode image: {label}"))
 }
 pub fn compare(before: Option<RgbaImage>, after: Option<RgbaImage>) -> anyhow::Result<Comparison> {
-    ensure!(
-        before.is_some() || after.is_some(),
-        "比較する画像がありません"
-    );
+    ensure!(before.is_some() || after.is_some(), "No images to compare");
     let width = before
         .iter()
         .chain(after.iter())

@@ -6,6 +6,8 @@ description = "Terminal image diff viewer using the Kitty Graphics Protocol"
 
 [dependencies]
 anyhow = "1.0"
+base64-simd = "0.8"
+flate2 = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }

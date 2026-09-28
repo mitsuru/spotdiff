@@ -36,7 +36,7 @@ impl Worker {
         self.generation.store(r.generation, Ordering::Relaxed);
         self.requests
             .send(r)
-            .map_err(|_| anyhow::anyhow!("描画ワーカーが終了しました"))
+            .map_err(|_| anyhow::anyhow!("Rendering worker stopped"))
     }
     pub fn poll(&self) -> Option<ResultMessage> {
         match self.results.try_recv() {
@@ -44,7 +44,7 @@ impl Worker {
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => Some((
                 self.generation.load(Ordering::Relaxed),
-                Err(anyhow::anyhow!("描画ワーカーが終了しました")),
+                Err(anyhow::anyhow!("Rendering worker stopped")),
             )),
         }
     }
@@ -79,6 +79,7 @@ mod tests {
                 height: 1,
             },
             cell_pixels: (1, 1),
+            compress: false,
             image_ids: vec![],
         })
         .unwrap();
