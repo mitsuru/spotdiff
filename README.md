@@ -1,0 +1,87 @@
+# spotdiff
+
+Rustで作るターミナル画像diffビューア。Kitty Graphics Protocolで画像を表示し、変更前後の左右比較と変更箇所の強調を切り替えられます。
+
+lazygitで画像を選択して`I`を押すと全画面ビューアを開きます。`q`で終了し、lazygitの復帰プロンプトでEnterを押すと戻ります。
+
+## インストール
+
+RustとCargo、Kitty Graphics ProtocolのUnicode placeholdersに対応した端末が必要です。Rust 1.96.0でビルドを検証しています。最初の対象環境はLinuxのKittyです。
+
+```sh
+cargo install --path . --locked
+```
+
+インストール先の`~/.cargo/bin`をPATHに追加してください。インストールせず試す場合は`cargo run -- before.png after.png`で起動できます。
+
+## 使い方
+
+```sh
+# 2つの画像ファイル
+spotdiff before.png after.png
+
+# 未ステージの変更: index → 作業ツリー
+spotdiff git -- assets/image.png
+
+# ステージ済みの変更: HEAD → index
+spotdiff git --staged -- assets/image.png
+```
+
+PNG・JPEG・静止WebPを読み込めます。透過部分は市松模様で表示します。Gitモードでは新規追加、未追跡、`git add -N`、削除、初回コミット前も扱います。ファイル名は呼び出したディレクトリから指定できます。
+
+変更がない場合もビューアを開きます。終了コードは正常終了で0、読み込みや端末のエラーで非ゼロです。Gitのファイル・index・設定は変更しません。
+
+| キー | 操作 |
+| --- | --- |
+| `Tab` | 左右比較 / 差分強調 |
+| `+` / `-` | ズームイン / ズームアウト |
+| 矢印 / `h j k l` | 表示位置を移動 |
+| `f` | 画面にフィット |
+| `1` | 1倍（画像の1pxを端末の1pxに合わせる） |
+| `q` / `Esc` / `Ctrl-C` | 終了 |
+
+左右は同じ画像座標・倍率・位置で表示します。リサイズ時もフィット中は倍率を再計算し、手動ズーム中は倍率を維持します。ピクセルの境界を確認しやすいよう、表示のリサイズにはnearest neighborを使います。
+
+## lazygitとの連携
+
+[examples/lazygit.yml](examples/lazygit.yml)を既存のlazygit設定の`customCommands`へマージしてください。設定ファイルはlazygitのStatusパネルで`e`を押して開けます。すでに`customCommands`がある場合はキーを重複させず、配列の項目を追加してください。
+
+- `I`：未ステージ変更があればindexと作業ツリーを比較し、それ以外はHEADとindexを比較。
+- `Ctrl-S`：ステージ済みの変更を明示的に比較。
+- 両方に変更があるファイルでは、`I`は未ステージを優先します。
+
+既存キーバインドと重複する場合は設定例の`key`を変更してください。画像以外のファイルでは説明付きエラーを返します。`output: terminal`でlazygitを一時停止して起動します。lazygit 0.65.0では終了後に`Press enter to return to lazygit`が出るのでEnterを押してください。
+
+lazygitのdiffパネル内表示は将来の拡張です。初期版の連携は全画面ビューアで行います。
+
+## 差分の定義と制限
+
+- デコードした8ビットRGBAを、拡大縮小する前に比較します。RGBA値が1つでも異なれば変更です。ただし両側ともalpha=0ならRGBの違いを無視します。
+- サイズ違いは左上を揃えて比較します。片側だけに存在するピクセルも変更です。変更率の分母は少なくとも片側にピクセルが存在する領域です。
+- 差分強調では変更箇所をマゼンタで表示し、変更のない領域を暗くします。削除領域には変更前の画像を使います。
+- 各入力のデコード後のRGBAと比較キャンバスは、それぞれ256 MiB以下です。合計メモリ使用量はこの値より大きくなります。
+- 描画ライブラリの制限により、各画像の表示領域は最大297列×297行です。大きな端末でも、この領域にフィットして表示し、ズーム時は画像全体を移動して確認できます。
+- FIFOやデバイスなど通常ファイル以外の入力は拒否します。
+- SVG、アニメーション、知覚的な差分、ICCによる色管理、EXIFによる自動回転、Git LFSの展開、リネーム追跡、merge conflict、シンボリックリンクには対応していません。
+- tmux/screen内では起動を拒否します。対応端末で直接実行してください。非対応端末では文字表示へのフォールバックを行いません。
+- 対話用TTYが必要です。画像制御列をファイルへリダイレクトして利用する形式ではありません。
+
+## 開発と検証
+
+```sh
+cargo fmt --check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
+cargo build --locked --example terminal-failure
+python tests/terminal_pty.py target/debug/spotdiff target/debug/examples/terminal-failure
+python tests/lazygit_pty.py target/debug/spotdiff
+```
+
+PTYテストは端末応答を模擬し、端末モード・カーソル・画面の復元を検証します。lazygitのPTYテストはインストール済みのlazygitと一時設定を使用します。画像の見え方と実画面での復帰は[実機検証手順](docs/manual-testing.md)で確認してください。
+
+## 設計
+
+[設計仕様](docs/superpowers/specs/2026-09-28-spotdiff-design.md)と[実装計画](docs/superpowers/plans/2026-09-28-spotdiff.md)を参照してください。画像取得・差分生成はターミナル描画から分離しています。
+
+[実装・検証記録](docs/implementation-notes.md)に独立レビューの修正と実装中の判断をまとめています。

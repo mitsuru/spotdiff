@@ -1,0 +1,13 @@
+# 既存のlazygit config.ymlのcustomCommandsへマージしてください。
+# spotdiffをqで終了後、lazygitの復帰プロンプトでEnterを押します。
+customCommands:
+  - key: 'I'
+    context: 'files'
+    description: '画像の変更を比較'
+    command: 'spotdiff git {{if not .SelectedFile.HasUnstagedChanges}}--staged {{end}}-- {{.SelectedFile.Name | quote}}'
+    output: terminal
+  - key: '<c-s>'
+    context: 'files'
+    description: 'ステージ済み画像の変更を比較'
+    command: 'spotdiff git --staged -- {{.SelectedFile.Name | quote}}'
+    output: terminal
