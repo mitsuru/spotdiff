@@ -45,6 +45,7 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
         let mut prepared: Option<PreparedFrame> = None;
         let mut pending_ids = Vec::new();
         let mut submitted = None;
+        let mut displayed_area = None;
         loop {
             let size = terminal.size()?;
             let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -56,15 +57,20 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
                 // its replacement is ready, so an operation doesn't flash blank.
                 submitted = Some(app.generation());
                 let viewport = app.viewport();
-                let reused = prepared.as_mut().is_some_and(|frame| {
-                    frame.pan_to(
-                        app.comparison(),
-                        app.generation(),
-                        app.mode(),
-                        viewport,
-                        cell,
-                    )
-                });
+                // Ratatui clears the screen when its terminal area changes.
+                // Some Kitty implementations also delete image storage on that
+                // clear, even when the rasterized viewport dimensions are equal.
+                let reused = displayed_area == Some(area)
+                    && terminal.get_frame().area() == area
+                    && prepared.as_mut().is_some_and(|frame| {
+                        frame.pan_to(
+                            app.comparison(),
+                            app.generation(),
+                            app.mode(),
+                            viewport,
+                            cell,
+                        )
+                    });
                 if reused {
                     session.delete_ids(&pending_ids)?;
                     pending_ids.clear();
@@ -130,16 +136,28 @@ pub fn run(request: cli::Request) -> anyhow::Result<()> {
             if dirty {
                 session.begin_update()?;
                 session.delete_ids(&retired_ids)?;
-                terminal.draw(|f| Renderer::draw(f, &app, prepared.as_ref(), &labels))?;
-                if let Some(frame) = prepared.as_mut() {
+                let rendered_area = terminal
+                    .draw(|f| Renderer::draw(f, &app, prepared.as_ref(), &labels))?
+                    .area;
+                // draw() queries the size again. A concurrent resize can clear
+                // cached images after we selected a frame for the old area.
+                if rendered_area != area {
+                    displayed_area = None;
+                    submitted = None;
+                } else if let Some(frame) = prepared.as_mut() {
                     Renderer::write_images(terminal.backend_mut(), area, &app, frame)?;
                     terminal.backend_mut().flush()?;
+                    displayed_area = Some(area);
                 }
                 session.end_update()?;
             }
             // Poll input frequently only while an asynchronous frame is pending.
             // Completed frames otherwise waited for the full 50ms idle timeout.
-            let timeout = if pending_ids.is_empty() { 50 } else { 4 };
+            let timeout = if pending_ids.is_empty() && submitted.is_some() {
+                50
+            } else {
+                4
+            };
             if event::poll(Duration::from_millis(timeout))? {
                 let mut quit = false;
                 loop {

@@ -204,6 +204,23 @@ class TerminalTests(unittest.TestCase):
                          [(10, 0)] * 2 + [(10, 20)] * 2 + [(0, 20)] * 2 + [(0, 0)] * 2)
         self.assertEqual(len({p[b'i'] for p in placements}), 2)
 
+    def test_resize_reuploads_both_images_when_viewport_pixels_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'resize.png'
+            path.write_bytes(png(500, 300))
+            code, output, _ = self.run_pty([BINARY, str(path), str(path)],
+                compression=True, steps=[
+                    ((12, 49, 490, 240), 1), (b'q', 0),
+                ])
+        self.assertEqual(code, 0)
+        uploads = re.findall(rb'\x1b_G([^;]*a=T[^;]*);', output)
+        self.assertEqual(len(uploads), 4,
+                         'resize clears terminal images, so both panes must upload again')
+        self.assertNotIn(b'a=p,', output,
+                         'placement reuse refers to images deleted by the resize clear')
+        dimensions = [re.findall(rb'(?:^|,)([sv]=\d+)', header) for header in uploads]
+        self.assertEqual(dimensions[:2], dimensions[2:])
+
     def test_pan_beyond_buffer_refreshes_and_cleans_up_owned_images(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'pan.png'
