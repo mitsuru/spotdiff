@@ -1,8 +1,12 @@
 use spotdiff::{cli::Request, source::load};
-use std::{fs, path::Path, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 use tempfile::TempDir;
-fn git(root: &Path, args: &[&str]) -> Vec<u8> {
-    let out = Command::new("git")
+fn git_output(root: &Path, args: &[&str]) -> Output {
+    Command::new("git")
         .arg("-C")
         .arg(root)
         .args(args)
@@ -13,7 +17,10 @@ fn git(root: &Path, args: &[&str]) -> Vec<u8> {
         .env("GIT_COMMITTER_NAME", "Test")
         .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
         .output()
-        .unwrap();
+        .unwrap()
+}
+fn git(root: &Path, args: &[&str]) -> Vec<u8> {
+    let out = git_output(root, args);
     assert!(
         out.status.success(),
         "{}",
@@ -106,13 +113,18 @@ fn conflicted_index_is_error() {
     git(r.path(), &["checkout", "-q", "-"]);
     fs::write(r.path().join("a.png"), b"main").unwrap();
     git(r.path(), &["commit", "-qam", "main"]);
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(r.path())
-        .args(["merge", "other"])
-        .output()
-        .unwrap();
-    assert!(load(&req("a.png", false), r.path()).is_err());
+    let merge = git_output(r.path(), &["merge", "other"]);
+    assert_eq!(
+        merge.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&merge.stderr)
+    );
+    assert!(!git(r.path(), &["ls-files", "--unmerged"]).is_empty());
+    for staged in [false, true] {
+        let error = load(&req("a.png", staged), r.path()).unwrap_err();
+        assert!(error.to_string().contains("merge conflict"), "{error}");
+    }
 }
 #[test]
 fn corrupt_head_is_error() {
