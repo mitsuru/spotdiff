@@ -42,16 +42,19 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: Run Rust tests
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --workspace --locked --all-targets -- -D warnings
 
       - name: Build release binaries and test helper
-        run: cargo build --locked --release --bins --examples
+        run: cargo build --workspace --locked --release --bins --examples
+
+      - name: Verify distributable crate
+        run: cargo package -p spotdiff --locked
 
       - name: Run terminal PTY tests
         run: python3 tests/terminal_pty.py target/release/spotdiff target/release/examples/terminal-failure
