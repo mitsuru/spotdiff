@@ -6,7 +6,7 @@ Rustで作るターミナル画像diffビューア。Kitty Graphics Protocolで�
 
 lazygitで画像を選択して`I`を押すと全画面ビューアを開きます。`q`で終了し、lazygitの復帰プロンプトでEnterを押すと戻ります。
 
-![spotdiffの左右比較。左が変更前、右が変更後で、円と長方形の色の変更と黄色いバーの追加を確認できる](docs/images/side-by-side.png)
+![spotdiffの左右比較。左が変更前、右が変更後で、円と長方形の色の変更と黄色いバーの追加を確認できる](https://raw.githubusercontent.com/mitsuru/spotdiff/main/docs/images/side-by-side.png)
 
 左が`Before`、右が`After`です。フッターには表示モード・倍率・変更ピクセル数・変更率を表示します。
 
@@ -15,7 +15,7 @@ lazygitで画像を選択して`I`を押すと全画面ビューアを開きま�
 RustとCargo、Kitty Graphics Protocolに対応した端末（Kitty、Ghosttyなど）が必要です。Rust 1.96.0でビルドを検証しています。
 
 ```sh
-cargo install --path . --locked
+cargo install --path crates/spotdiff --locked
 ```
 
 インストール先の`~/.cargo/bin`をPATHに追加してください。インストールせず試す場合は`cargo run --release -- before.png after.png`で起動できます。画像処理にはreleaseビルドを使ってください。
@@ -49,11 +49,11 @@ cargo run --release --locked -- docs/images/before.png docs/images/after.png
 
 **差分強調（`Tab`を1回）**：変更部分をマゼンタで強調し、変更のない部分を暗く表示します。円と長方形の色の変更に加え、追加したバーの位置も確認できます。
 
-![差分強調モード。色を変更した円と長方形、追加したバーがマゼンタで強調されている](docs/images/highlight.png)
+![差分強調モード。色を変更した円と長方形、追加したバーがマゼンタで強調されている](https://raw.githubusercontent.com/mitsuru/spotdiff/main/docs/images/highlight.png)
 
 **Blink（`Tab`を2回）**：1つの枠で変更前後を切り替え、同じ位置を見ながら比較できます。`Space`で手動切り替え、`a`でGIFのように500ms間隔の自動切り替えを開始します。もう一度`a`を押すと停止します。
 
-![Blinkモード。BeforeとAfterを同じ枠で交互に表示し、色の変更とバーの追加が分かる](docs/images/blink.gif)
+![Blinkモード。BeforeとAfterを同じ枠で交互に表示し、色の変更とバーの追加が分かる](https://raw.githubusercontent.com/mitsuru/spotdiff/main/docs/images/blink.gif)
 
 ### キー操作
 
@@ -76,7 +76,7 @@ Blinkに入ると、1つの枠に`Before`を表示して手動モードで開始
 
 ## lazygitとの連携
 
-[examples/lazygit.yml](examples/lazygit.yml)を既存のlazygit設定の`customCommands`へマージしてください。設定ファイルはlazygitのStatusパネルで`e`を押して開けます。すでに`customCommands`がある場合はキーを重複させず、配列の項目を追加してください。
+[examples/lazygit.yml](https://github.com/mitsuru/spotdiff/blob/main/examples/lazygit.yml)を既存のlazygit設定の`customCommands`へマージしてください。設定ファイルはlazygitのStatusパネルで`e`を押して開けます。すでに`customCommands`がある場合はキーを重複させず、配列の項目を追加してください。
 
 - `I`：未ステージ変更があればindexと作業ツリーを比較し、それ以外はHEADとindexを比較。
 - `Ctrl-S`：ステージ済みの変更を明示的に比較。
@@ -100,24 +100,26 @@ lazygitのdiffパネル内表示は将来の拡張です。初期版の連携は
 
 ## 開発と検証
 
-GitHub Actionsはmainへのpushとmainを対象とするPRで、Ubuntu 24.04・Rust 1.96.0を使ってfmt、Rustテスト、Clippy、releaseビルド、端末のPTYテストを実行します。lazygit 0.65.0を用意し、起動・復帰の連携テストも実行します。
+ルートの`Cargo.toml`はvirtual workspaceです。`crates/spotdiff`にバイナリ・ライブラリ・Rustテスト・Rust exampleをまとめ、依存関係とパッケージ情報はルートで管理します。`Cargo.lock`と`target/`はworkspace全体で共有し、PythonのPTYテストとlazygit設定例はルートに置いています。Cargoコマンドはリポジトリのルートから実行してください。
+
+GitHub Actionsはmainへのpushとmainを対象とするPRで、Ubuntu 24.04・Rust 1.96.0を使ってworkspace全体のfmt、Rustテスト、Clippy、releaseビルド、端末のPTYテストを実行します。配布用crateの作成・ビルド検証と、lazygit 0.65.0での起動・復帰の連携テストも実行します。
 
 ```sh
-cargo fmt --check
-cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
-cargo build --locked --release
-cargo build --locked --example terminal-failure
-python tests/terminal_pty.py target/debug/spotdiff target/debug/examples/terminal-failure
-python tests/lazygit_pty.py target/debug/spotdiff
+cargo fmt --all --check
+cargo test --workspace --locked
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo build --workspace --locked --release --bins --examples
+cargo package -p spotdiff --locked
+python3 tests/terminal_pty.py target/release/spotdiff target/release/examples/terminal-failure
+python3 tests/lazygit_pty.py target/release/spotdiff
 ```
 
-PTYテストは端末応答を模擬し、端末モード・カーソル・画面の復元を検証します。lazygitのPTYテストはインストール済みのlazygitと一時設定を使用します。画像の見え方と実画面での復帰は[実機検証手順](docs/manual-testing.md)で確認してください。
+PTYテストは端末応答を模擬し、端末モード・カーソル・画面の復元を検証します。lazygitのPTYテストはインストール済みのlazygitと一時設定を使用します。画像の見え方と実画面での復帰は[実機検証手順](https://github.com/mitsuru/spotdiff/blob/main/docs/manual-testing.md)で確認してください。
 
 ## 設計
 
-[設計仕様](docs/superpowers/specs/2026-09-28-spotdiff-design.md)と[実装計画](docs/superpowers/plans/2026-09-28-spotdiff.md)を参照してください。画像取得・差分生成はターミナル描画から分離しています。
+[設計仕様](https://github.com/mitsuru/spotdiff/blob/main/docs/superpowers/specs/2026-09-28-spotdiff-design.md)と[実装計画](https://github.com/mitsuru/spotdiff/blob/main/docs/superpowers/plans/2026-09-28-spotdiff.md)を参照してください。画像取得・差分生成はターミナル描画から分離しています。
 
-[実装・検証記録](docs/implementation-notes.md)に独立レビューの修正と実装中の判断をまとめています。
+[実装・検証記録](https://github.com/mitsuru/spotdiff/blob/main/docs/implementation-notes.md)に独立レビューの修正と実装中の判断をまとめています。
 
-Ghosttyでの更新遅延に対する画像転送の改善と計測条件は[性能確認](docs/performance.md)を参照してください。
+Ghosttyでの更新遅延に対する画像転送の改善と計測条件は[性能確認](https://github.com/mitsuru/spotdiff/blob/main/docs/performance.md)を参照してください。
