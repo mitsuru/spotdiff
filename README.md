@@ -6,7 +6,7 @@ Rustで作るターミナル画像diffビューア。Kitty Graphics Protocolで�
 
 lazygitで画像を選択して`I`を押すと全画面ビューアを開きます。`q`で終了し、lazygitの復帰プロンプトでEnterを押すと戻ります。
 
-![spotdiffの左右比較。左が変更前、右が変更後で、円と長方形の色の変更と黄色いバーの追加を確認できる](docs/images/side-by-side.png)
+![spotdiffの左右比較。左が変更前、右が変更後で、円と長方形の色の変更と黄色いバーの追加を確認できる](https://raw.githubusercontent.com/mitsuru/spotdiff/main/docs/images/side-by-side.png)
 
 左が`Before`、右が`After`です。フッターには表示モード・倍率・変更ピクセル数・変更率を表示します。
 
@@ -49,11 +49,11 @@ cargo run --release --locked -- docs/images/before.png docs/images/after.png
 
 **差分強調（`Tab`を1回）**：変更部分をマゼンタで強調し、変更のない部分を暗く表示します。円と長方形の色の変更に加え、追加したバーの位置も確認できます。
 
-![差分強調モード。色を変更した円と長方形、追加したバーがマゼンタで強調されている](docs/images/highlight.png)
+![差分強調モード。色を変更した円と長方形、追加したバーがマゼンタで強調されている](https://raw.githubusercontent.com/mitsuru/spotdiff/main/docs/images/highlight.png)
 
 **Blink（`Tab`を2回）**：1つの枠で変更前後を切り替え、同じ位置を見ながら比較できます。`Space`で手動切り替え、`a`でGIFのように500ms間隔の自動切り替えを開始します。もう一度`a`を押すと停止します。
 
-![Blinkモード。BeforeとAfterを同じ枠で交互に表示し、色の変更とバーの追加が分かる](docs/images/blink.gif)
+![Blinkモード。BeforeとAfterを同じ枠で交互に表示し、色の変更とバーの追加が分かる](https://raw.githubusercontent.com/mitsuru/spotdiff/main/docs/images/blink.gif)
 
 ### キー操作
 
@@ -100,7 +100,7 @@ lazygitのdiffパネル内表示は将来の拡張です。初期版の連携は
 
 ## 開発と検証
 
-ルートの`Cargo.toml`はvirtual workspaceです。`crates/spotdiff`にバイナリ・ライブラリ・Rustテストをまとめ、依存関係とパッケージ情報はルートで管理します。`Cargo.lock`と`target/`はworkspace全体で共有し、PythonのPTYテストとlazygit設定例はルートに置いています。Cargoコマンドはリポジトリのルートから実行してください。
+ルートの`Cargo.toml`はvirtual workspaceです。`crates/spotdiff`にバイナリ・ライブラリ・Rustテスト・Rust exampleをまとめ、依存関係とパッケージ情報はルートで管理します。`Cargo.lock`と`target/`はworkspace全体で共有し、PythonのPTYテストとlazygit設定例はルートに置いています。Cargoコマンドはリポジトリのルートから実行してください。
 
 GitHub Actionsはmainへのpushとmainを対象とするPRで、Ubuntu 24.04・Rust 1.96.0を使ってworkspace全体のfmt、Rustテスト、Clippy、releaseビルド、端末のPTYテストを実行します。配布用crateの作成・ビルド検証と、lazygit 0.65.0での起動・復帰の連携テストも実行します。
 
